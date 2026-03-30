@@ -9,8 +9,14 @@
 LOWER=40
 UPPER=80
 LANG_CODE="en"
+VOLUME=70
+INHIBIT_SLEEP_ON_AC=1
+BOOST_SYSTEM_VOLUME_ON_ALERT=0
 LOGFILE="/tmp/battalert.log"
 CONFIG_FILE="/etc/default/battalert"
+INHIBIT_PID=""
+PW_CAT_BIN=""
+WPCTL_BIN=""
 
 # Notification repeat interval (seconds)
 REPEAT_INTERVAL=30
@@ -44,6 +50,9 @@ load_config() {
     LOWER="${LOWER:-40}"
     UPPER="${UPPER:-80}"
     LANG_CODE="${LANG_CODE:-en}"
+    VOLUME="${VOLUME:-70}"
+    INHIBIT_SLEEP_ON_AC="${INHIBIT_SLEEP_ON_AC:-1}"
+    BOOST_SYSTEM_VOLUME_ON_ALERT="${BOOST_SYSTEM_VOLUME_ON_ALERT:-0}"
 
     if ! [[ "$LOWER" =~ ^[0-9]+$ ]]; then
         LOWER=40
@@ -52,6 +61,24 @@ load_config() {
     if ! [[ "$UPPER" =~ ^[0-9]+$ ]]; then
         UPPER=80
     fi
+
+    if ! [[ "$VOLUME" =~ ^[0-9]+$ ]]; then
+        VOLUME=70
+    fi
+
+    if [ "$VOLUME" -lt 0 ] || [ "$VOLUME" -gt 100 ]; then
+        VOLUME=70
+    fi
+
+    case "$INHIBIT_SLEEP_ON_AC" in
+        0|1) ;;
+        *) INHIBIT_SLEEP_ON_AC=1 ;;
+    esac
+
+    case "$BOOST_SYSTEM_VOLUME_ON_ALERT" in
+        0|1) ;;
+        *) BOOST_SYSTEM_VOLUME_ON_ALERT=0 ;;
+    esac
 
     if [ "$LOWER" -ge "$UPPER" ]; then
         LOWER=40
@@ -97,7 +124,8 @@ is_on_ac_power() {
             local TYPE
             TYPE=$(cat "$SUPPLY/type" 2>/dev/null)
 
-            if [ "$TYPE" = "Mains" ] || [ "$TYPE" = "USB" ]; then
+            # Consider any non-battery power supply with online=1 as AC power.
+            if [ "$TYPE" != "Battery" ]; then
                 if [ "$(cat "$SUPPLY/online" 2>/dev/null)" = "1" ]; then
                     return 0
                 fi
@@ -106,6 +134,132 @@ is_on_ac_power() {
     done
 
     return 1
+}
+
+start_sleep_inhibit() {
+    if [ "$INHIBIT_SLEEP_ON_AC" -ne 1 ]; then
+        return
+    fi
+
+    if [ -n "$INHIBIT_PID" ] && kill -0 "$INHIBIT_PID" 2>/dev/null; then
+        return
+    fi
+
+    systemd-inhibit \
+        --what=sleep \
+        --mode=block \
+        --why="Battalert: AC power connected" \
+        sleep infinity &
+    INHIBIT_PID=$!
+}
+
+stop_sleep_inhibit() {
+    if [ -n "$INHIBIT_PID" ] && kill -0 "$INHIBIT_PID" 2>/dev/null; then
+        kill "$INHIBIT_PID" 2>/dev/null || true
+        wait "$INHIBIT_PID" 2>/dev/null || true
+    fi
+    INHIBIT_PID=""
+}
+
+resolve_pw_cat() {
+    if command -v pw-cat >/dev/null 2>&1; then
+        PW_CAT_BIN="pw-cat"
+    else
+        PW_CAT_BIN=""
+    fi
+}
+
+resolve_wpctl() {
+    if command -v wpctl >/dev/null 2>&1; then
+        WPCTL_BIN="wpctl"
+    else
+        WPCTL_BIN=""
+    fi
+}
+
+get_default_sink_volume() {
+    sudo -u "$ACTIVE_USER" \
+        XDG_RUNTIME_DIR="$XDG_DIR" \
+        DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR" \
+        "$WPCTL_BIN" get-volume @DEFAULT_AUDIO_SINK@ 2>>"$LOGFILE"
+}
+
+compare_float_lt() {
+    awk -v left="$1" -v right="$2" 'BEGIN { exit !(left < right) }'
+}
+
+set_default_sink_volume() {
+    sudo -u "$ACTIVE_USER" \
+        XDG_RUNTIME_DIR="$XDG_DIR" \
+        DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR" \
+        "$WPCTL_BIN" set-volume @DEFAULT_AUDIO_SINK@ "$1" 2>>"$LOGFILE"
+}
+
+set_default_sink_mute() {
+    sudo -u "$ACTIVE_USER" \
+        XDG_RUNTIME_DIR="$XDG_DIR" \
+        DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR" \
+        "$WPCTL_BIN" set-mute @DEFAULT_AUDIO_SINK@ "$1" 2>>"$LOGFILE"
+}
+
+play_sound() {
+    local SOUND="$1"
+    local TARGET_SYSTEM_VOLUME
+    local PW_CAT_VOLUME="1"
+    local ORIGINAL_VOLUME_OUTPUT
+    local ORIGINAL_VOLUME
+    local ORIGINAL_MUTED
+    local SHOULD_RESTORE=0
+
+    if [ ! -f "$SOUND" ]; then
+        return
+    fi
+
+    if [ -z "$PW_CAT_BIN" ]; then
+        echo "$(date) - pw-cat not found; sound notification skipped" >> "$LOGFILE"
+        return
+    fi
+
+    TARGET_SYSTEM_VOLUME=$(awk "BEGIN { printf \"%.2f\", $VOLUME / 100 }")
+
+    if [ "$BOOST_SYSTEM_VOLUME_ON_ALERT" -eq 1 ] && [ -n "$WPCTL_BIN" ]; then
+        ORIGINAL_VOLUME_OUTPUT=$(get_default_sink_volume)
+        ORIGINAL_VOLUME=$(printf '%s\n' "$ORIGINAL_VOLUME_OUTPUT" | awk '/Volume:/ { print $2 }')
+        ORIGINAL_MUTED=0
+
+        if printf '%s\n' "$ORIGINAL_VOLUME_OUTPUT" | grep -q '\[MUTED\]'; then
+            ORIGINAL_MUTED=1
+        fi
+
+        if [ "$ORIGINAL_MUTED" -eq 1 ]; then
+            set_default_sink_mute 0
+            SHOULD_RESTORE=1
+        fi
+
+        if [ -z "$ORIGINAL_VOLUME" ] || compare_float_lt "$ORIGINAL_VOLUME" "$TARGET_SYSTEM_VOLUME"; then
+            set_default_sink_volume "$TARGET_SYSTEM_VOLUME"
+            SHOULD_RESTORE=1
+        fi
+
+        sudo -u "$ACTIVE_USER" \
+            XDG_RUNTIME_DIR="$XDG_DIR" \
+            PIPEWIRE_RUNTIME_DIR="$XDG_DIR" \
+            "$PW_CAT_BIN" --playback --volume="$PW_CAT_VOLUME" "$SOUND" \
+            2>>"$LOGFILE"
+
+        if [ "$SHOULD_RESTORE" -eq 1 ]; then
+            if [ -n "$ORIGINAL_VOLUME" ]; then
+                set_default_sink_volume "$ORIGINAL_VOLUME"
+            fi
+            set_default_sink_mute "$ORIGINAL_MUTED"
+        fi
+    else
+        sudo -u "$ACTIVE_USER" \
+            XDG_RUNTIME_DIR="$XDG_DIR" \
+            PIPEWIRE_RUNTIME_DIR="$XDG_DIR" \
+            "$PW_CAT_BIN" --playback --volume="$PW_CAT_VOLUME" "$SOUND" \
+            2>>"$LOGFILE" &
+    fi
 }
 
 send_notification() {
@@ -123,14 +277,11 @@ send_notification() {
             --urgency="$URGENCY" \
             --expire-time=0 \
             --replace-id="$NOTIFY_ID" \
-            "$TITLE" "$BODY"
+            "$TITLE" "$BODY" \
+            >>"$LOGFILE" 2>&1 \
+        || echo "$(date) - notify-send failed for notification id $NOTIFY_ID" >> "$LOGFILE"
 
-    if [ -f "$SOUND" ]; then
-        sudo -u "$ACTIVE_USER" \
-            XDG_RUNTIME_DIR="$XDG_DIR" \
-            PULSE_SERVER="$PULSE_SERVER" \
-            paplay "$SOUND" &
-    fi
+    play_sound "$SOUND"
 
     LAST_NOTIFY_TIME=$(date +%s)
     echo "$(date) - $TITLE | $BODY" >> "$LOGFILE"
@@ -146,7 +297,9 @@ close_notification() {
             --dest org.freedesktop.Notifications \
             --object-path /org/freedesktop/Notifications \
             --method org.freedesktop.Notifications.CloseNotification \
-            "$1" 2>/dev/null
+            "$1" \
+            >>"$LOGFILE" 2>&1 \
+        || echo "$(date) - CloseNotification failed for notification id $1" >> "$LOGFILE"
 
     # Fallback method: replace notification with empty one for 1ms
     sudo -u "$ACTIVE_USER" \
@@ -156,7 +309,9 @@ close_notification() {
         notify-send \
             --replace-id="$1" \
             --expire-time=1 \
-            " " " " 2>/dev/null
+            " " " " \
+            >>"$LOGFILE" 2>&1 \
+        || echo "$(date) - notify-send fallback failed for notification id $1" >> "$LOGFILE"
 }
 
 should_repeat() {
@@ -166,8 +321,16 @@ should_repeat() {
     [ "$ELAPSED" -ge "$REPEAT_INTERVAL" ]
 }
 
+cleanup() {
+    stop_sleep_inhibit
+}
+
+trap cleanup EXIT INT TERM
+
 load_config
 set_language_strings
+resolve_pw_cat
+resolve_wpctl
 
 # --- Main loop ---
 while true; do
@@ -183,6 +346,12 @@ while true; do
     ON_AC=0
     if is_on_ac_power; then
         ON_AC=1
+    fi
+
+    if [ "$ON_AC" -eq 1 ]; then
+        start_sleep_inhibit
+    else
+        stop_sleep_inhibit
     fi
 
     if [[ "$LEVEL" =~ ^[0-9]+$ ]]; then
